@@ -14,6 +14,13 @@ import requests
 from datetime import datetime, timedelta
 import pytz
 import time
+import json
+import os
+
+# ============================================================
+# 쿨다운 파일 경로 (Streamlit Cloud에서는 /tmp 사용)
+# ============================================================
+COOLDOWN_FILE = "/tmp/stock_alert_cooldown.json"
 
 # ============================================================
 # 페이지 설정
@@ -38,6 +45,66 @@ def get_telegram_config():
         return "", ""
 
 BOT_TOKEN, CHAT_ID = get_telegram_config()
+
+# ============================================================
+# 쿨다운 관리 함수들 (파일 기반 - 안정적)
+# ============================================================
+def load_cooldown_data():
+    """쿨다운 데이터를 파일에서 불러옵니다."""
+    try:
+        if os.path.exists(COOLDOWN_FILE):
+            with open(COOLDOWN_FILE, 'r') as f:
+                data = json.load(f)
+                return {k: datetime.fromisoformat(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def save_cooldown_data(data):
+    """쿨다운 데이터를 파일에 저장합니다."""
+    try:
+        serializable = {k: v.isoformat() for k, v in data.items()}
+        with open(COOLDOWN_FILE, 'w') as f:
+            json.dump(serializable, f)
+    except Exception:
+        pass
+
+
+def can_send_alert(ticker, cooldown_minutes=30):
+    """알림 쿨다운 체크 (파일 기반)"""
+    cooldown_data = load_cooldown_data()
+    now = datetime.now()
+    last_alert = cooldown_data.get(ticker)
+    
+    if last_alert is None:
+        return True
+    
+    time_diff = (now - last_alert).total_seconds() / 60
+    return time_diff >= cooldown_minutes
+
+
+def record_alert(ticker):
+    """알림 발송 기록 저장 (파일 기반)"""
+    cooldown_data = load_cooldown_data()
+    cooldown_data[ticker] = datetime.now()
+    save_cooldown_data(cooldown_data)
+
+
+def get_last_alert_time(ticker):
+    """특정 종목의 마지막 알림 시간 조회"""
+    cooldown_data = load_cooldown_data()
+    return cooldown_data.get(ticker)
+
+
+def clear_old_cooldowns(hours=24):
+    """오래된 쿨다운 데이터 정리 (24시간 이상)"""
+    cooldown_data = load_cooldown_data()
+    now = datetime.now()
+    cleaned = {k: v for k, v in cooldown_data.items() 
+               if (now - v).total_seconds() < hours * 3600}
+    save_cooldown_data(cleaned)
+
 
 # ============================================================
 # 커스텀 CSS 스타일링
@@ -166,6 +233,15 @@ st.markdown("""
         background: rgba(231, 76, 60, 0.2);
         border: 1px solid #e74c3c;
     }
+    
+    .cooldown-info {
+        background: rgba(241, 196, 15, 0.2);
+        border: 1px solid #f1c40f;
+        padding: 8px 12px;
+        border-radius: 8px;
+        font-size: 0.85em;
+        margin-top: 8px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -175,17 +251,12 @@ st.markdown("""
 if 'watchlist' not in st.session_state:
     st.session_state.watchlist = ['NVDA', 'GOOGL', 'MRVL', 'MU', 'AVGO']
 
-if 'monitoring' not in st.session_state:
-    st.session_state.monitoring = False
-
-if 'last_alert_time' not in st.session_state:
-    st.session_state.last_alert_time = {}
-
 if 'alert_history' not in st.session_state:
     st.session_state.alert_history = []
 
-if 'last_data_fetch' not in st.session_state:
-    st.session_state.last_data_fetch = None
+if 'cooldown_cleaned' not in st.session_state:
+    clear_old_cooldowns(24)
+    st.session_state.cooldown_cleaned = True
 
 # ============================================================
 # 유틸리티 함수들
@@ -212,7 +283,6 @@ def is_market_open():
     ny_tz = pytz.timezone('America/New_York')
     now_ny = datetime.now(ny_tz)
     
-    # 주말 체크 (토요일=5, 일요일=6)
     if now_ny.weekday() >= 5:
         return False, now_ny, "주말"
     
@@ -227,25 +297,21 @@ def is_market_open():
         return False, now_ny, "장 마감"
 
 
-@st.cache_data(ttl=60)  # 60초 캐싱으로 API 호출 최소화
-def get_stock_data(ticker):
+@st.cache_data(ttl=60)
+def get_stock_data(ticker, _cache_buster=None):
     """주식 데이터 가져오기 (1분 단위, 최근 5일) - 캐싱 적용"""
     try:
         stock = yf.Ticker(ticker)
-        
-        # 1분 단위 데이터 (최대 7일까지 가능)
         df = stock.history(period="5d", interval="1m")
         
         if df.empty:
             return None, None, None, None, None
         
-        # RSI 계산 (14기간)
         df['RSI'] = calculate_rsi(df['Close'], period=14)
         
         current_price = df['Close'].iloc[-1]
         current_rsi = df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else None
         
-        # 전일 종가 가져오기
         daily_df = stock.history(period="5d", interval="1d")
         if len(daily_df) >= 2:
             prev_close = daily_df['Close'].iloc[-2]
@@ -285,33 +351,21 @@ def send_telegram_message(message):
         return False, f"오류: {str(e)}"
 
 
-def can_send_alert(ticker, cooldown_minutes=30):
-    """알림 쿨다운 체크 (30분에 한 번만)"""
-    now = datetime.now()
-    last_alert = st.session_state.last_alert_time.get(ticker)
-    
-    if last_alert is None:
-        return True
-    
-    time_diff = (now - last_alert).total_seconds() / 60
-    return time_diff >= cooldown_minutes
-
-
-def check_buy_signal(ticker, current_price, rsi, change_pct, rsi_threshold=30, drop_threshold=-5, cooldown=30):
-    """매수 신호 체크 및 알림 전송"""
+def check_buy_signal(ticker, current_price, rsi, change_pct, rsi_threshold=30, drop_threshold=-5, cooldown_minutes=30):
+    """매수 신호 체크 및 알림 전송 (파일 기반 쿨다운)"""
     signals = []
     
-    # RSI 임계값 이하 체크
     if rsi is not None and rsi <= rsi_threshold:
         signals.append(f"RSI {rsi:.1f} (과매도)")
     
-    # 하락률 임계값 이하 체크
     if change_pct is not None and change_pct <= drop_threshold:
         signals.append(f"전일 대비 {change_pct:.2f}% 하락")
     
-    if signals and can_send_alert(ticker, cooldown):
+    if signals:
         signal_text = " / ".join(signals)
-        message = f"""
+        
+        if can_send_alert(ticker, cooldown_minutes):
+            message = f"""
 🚨 <b>매수 신호 포착!</b>
 
 📊 종목: <b>{ticker}</b>
@@ -319,22 +373,27 @@ def check_buy_signal(ticker, current_price, rsi, change_pct, rsi_threshold=30, d
 📉 신호: {signal_text}
 
 ⏰ 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        """
-        
-        success, result = send_telegram_message(message)
-        
-        if success:
-            st.session_state.last_alert_time[ticker] = datetime.now()
-            st.session_state.alert_history.append({
-                'time': datetime.now().strftime('%H:%M:%S'),
-                'ticker': ticker,
-                'price': current_price,
-                'signal': signal_text
-            })
-        
-        return True, signal_text, success
+            """
+            
+            success, result = send_telegram_message(message)
+            
+            if success:
+                record_alert(ticker)
+                st.session_state.alert_history.append({
+                    'time': datetime.now().strftime('%H:%M:%S'),
+                    'ticker': ticker,
+                    'price': current_price,
+                    'signal': signal_text
+                })
+                return True, signal_text, True
+            else:
+                return True, signal_text, False
+        else:
+            last_time = get_last_alert_time(ticker)
+            remaining = cooldown_minutes - ((datetime.now() - last_time).total_seconds() / 60) if last_time else 0
+            return True, f"{signal_text} (쿨다운 {remaining:.0f}분 남음)", False
     
-    return len(signals) > 0, signals[0] if signals else None, False
+    return False, None, False
 
 
 def rate_limited_sleep(seconds):
@@ -350,7 +409,6 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # 텔레그램 연결 상태 표시
     st.markdown("### 📬 텔레그램 알림")
     
     if BOT_TOKEN and CHAT_ID:
@@ -372,7 +430,6 @@ TELEGRAM_BOT_TOKEN = "your-bot-token"
 TELEGRAM_CHAT_ID = "your-chat-id"
             """, language="toml")
     
-    # 텔레그램 테스트 버튼
     if st.button("📤 테스트 메시지 전송"):
         if BOT_TOKEN and CHAT_ID:
             with st.spinner("전송 중..."):
@@ -388,10 +445,8 @@ TELEGRAM_CHAT_ID = "your-chat-id"
     
     st.markdown("---")
     
-    # 관심 종목 관리
     st.markdown("### 📋 관심 종목 관리")
     
-    # 종목 추가
     new_ticker = st.text_input(
         "➕ 종목 추가",
         placeholder="예: AAPL",
@@ -406,7 +461,6 @@ TELEGRAM_CHAT_ID = "your-chat-id"
         else:
             st.warning(f"⚠️ {new_ticker}는 이미 목록에 있습니다.")
     
-    # 종목 삭제
     st.markdown("#### 🗑️ 종목 삭제")
     for ticker in st.session_state.watchlist:
         col1, col2 = st.columns([3, 1])
@@ -419,12 +473,30 @@ TELEGRAM_CHAT_ID = "your-chat-id"
     
     st.markdown("---")
     
-    # 알림 설정
     st.markdown("### 🔔 알림 조건")
     rsi_threshold = st.slider("RSI 임계값", 10, 50, 30, help="이 값 이하일 때 알림")
     drop_threshold = st.slider("하락률 임계값 (%)", -10, -1, -5, help="이 값 이하일 때 알림")
-    cooldown = st.slider("알림 간격 (분)", 10, 60, 30, help="동일 종목 알림 최소 간격")
-    refresh_interval = st.slider("데이터 갱신 간격 (초)", 30, 120, 60, help="실시간 감시 시 데이터 갱신 주기")
+    cooldown = st.slider("알림 간격 (분)", 10, 120, 30, help="동일 종목 알림 최소 간격")
+    refresh_interval = st.slider("데이터 갱신 간격 (초)", 30, 180, 60, help="실시간 감시 시 데이터 갱신 주기")
+    
+    st.markdown("---")
+    st.markdown("### ⏱️ 쿨다운 상태")
+    cooldown_data = load_cooldown_data()
+    if cooldown_data:
+        for ticker, last_time in cooldown_data.items():
+            elapsed = (datetime.now() - last_time).total_seconds() / 60
+            remaining = max(0, cooldown - elapsed)
+            if remaining > 0:
+                st.markdown(f"⏳ **{ticker}**: {remaining:.0f}분 후 알림 가능")
+            else:
+                st.markdown(f"✅ **{ticker}**: 알림 가능")
+    else:
+        st.caption("아직 알림 기록이 없습니다.")
+    
+    if st.button("🔄 쿨다운 초기화"):
+        save_cooldown_data({})
+        st.success("✅ 쿨다운이 초기화되었습니다.")
+        st.rerun()
 
 # ============================================================
 # 메인 화면
@@ -432,7 +504,6 @@ TELEGRAM_CHAT_ID = "your-chat-id"
 st.markdown("# 📈 미국 주식 저평가 매수 알림")
 st.markdown("##### RSI 과매도 및 급락 종목을 실시간으로 감시합니다")
 
-# 시장 상태 표시
 is_open, ny_time, market_status = is_market_open()
 
 col1, col2, col3 = st.columns([2, 2, 2])
@@ -453,7 +524,6 @@ with col3:
 
 st.markdown("---")
 
-# 실시간 감시 버튼
 col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
 
 with col_btn1:
@@ -462,10 +532,8 @@ with col_btn1:
 with col_btn2:
     refresh_btn = st.button("🔄 데이터 새로고침", use_container_width=True)
 
-# 데이터 표시 영역
 st.markdown("### 📊 관심 종목 현황")
 
-# 데이터 로드 및 표시
 if st.session_state.watchlist:
     data_rows = []
     signals_detected = []
@@ -473,18 +541,18 @@ if st.session_state.watchlist:
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    cache_buster = datetime.now().minute if refresh_btn else None
+    
     for idx, ticker in enumerate(st.session_state.watchlist):
         status_text.text(f"📡 {ticker} 데이터 로드 중...")
         progress_bar.progress((idx + 1) / len(st.session_state.watchlist))
         
-        current_price, rsi, change_pct, prev_close, df = get_stock_data(ticker)
+        current_price, rsi, change_pct, prev_close, df = get_stock_data(ticker, cache_buster)
         
-        # API 부하 방지를 위한 짧은 대기
         if idx < len(st.session_state.watchlist) - 1:
             rate_limited_sleep(0.5)
         
         if current_price is not None:
-            # RSI 상태 이모지
             if rsi is not None:
                 if rsi <= rsi_threshold:
                     rsi_status = "🔴 과매도"
@@ -495,7 +563,6 @@ if st.session_state.watchlist:
             else:
                 rsi_status = "⚪ N/A"
             
-            # 등락 상태 이모지
             if change_pct is not None:
                 if change_pct <= drop_threshold:
                     change_status = "🔴"
@@ -515,7 +582,6 @@ if st.session_state.watchlist:
                 '상태': rsi_status
             })
             
-            # 매수 신호 체크
             has_signal, signal_text, alert_sent = check_buy_signal(
                 ticker, current_price, rsi, change_pct, 
                 rsi_threshold, drop_threshold, cooldown
@@ -541,10 +607,6 @@ if st.session_state.watchlist:
     progress_bar.empty()
     status_text.empty()
     
-    # 마지막 업데이트 시간 저장
-    st.session_state.last_data_fetch = datetime.now()
-    
-    # 데이터프레임 표시
     df_display = pd.DataFrame(data_rows)
     st.dataframe(
         df_display,
@@ -560,28 +622,34 @@ if st.session_state.watchlist:
         }
     )
     
-    # 매수 신호 표시
     if signals_detected:
         st.markdown("### 🚨 매수 신호 감지!")
         for signal in signals_detected:
-            alert_icon = "📤" if signal['alert_sent'] else "⏳"
+            if signal['alert_sent']:
+                alert_icon = "📤"
+                alert_text = "알림 전송됨"
+            elif "쿨다운" in str(signal['signal']):
+                alert_icon = "⏳"
+                alert_text = "쿨다운 중"
+            else:
+                alert_icon = "⚠️"
+                alert_text = "전송 실패"
+            
             st.markdown(
                 f"""<div class="signal-alert">
-                    {alert_icon} <b>{signal['ticker']}</b> - 현재가 ${signal['price']:.2f} | {signal['signal']}
+                    {alert_icon} <b>{signal['ticker']}</b> - 현재가 ${signal['price']:.2f} | {signal['signal']} ({alert_text})
                 </div>""",
                 unsafe_allow_html=True
             )
     
-    # 알림 히스토리
     if st.session_state.alert_history:
         st.markdown("### 📜 알림 발송 기록")
-        history_df = pd.DataFrame(st.session_state.alert_history[-10:])  # 최근 10개만
+        history_df = pd.DataFrame(st.session_state.alert_history[-10:])
         st.dataframe(history_df, use_container_width=True, hide_index=True)
 
 else:
     st.info("📋 사이드바에서 관심 종목을 추가해주세요.")
 
-# 실시간 감시 모드
 if start_btn:
     if not is_open:
         st.warning(f"⚠️ 현재 미국 증시가 {market_status} 상태입니다. 개장 시간(09:30~16:00 EST)에 다시 시도해주세요.")
@@ -594,9 +662,7 @@ if start_btn:
         
         monitoring_placeholder = st.empty()
         
-        # 실시간 감시 루프
         while True:
-            # 시장 상태 재확인
             is_open, ny_time, market_status = is_market_open()
             
             if not is_open:
@@ -606,10 +672,10 @@ if start_btn:
             with monitoring_placeholder.container():
                 st.markdown(f"**마지막 업데이트**: {datetime.now().strftime('%H:%M:%S')}")
                 
+                cache_buster = datetime.now().timestamp()
+                
                 for idx, ticker in enumerate(st.session_state.watchlist):
-                    # 캐시 무효화를 위해 직접 호출
-                    get_stock_data.clear()
-                    current_price, rsi, change_pct, prev_close, df = get_stock_data(ticker)
+                    current_price, rsi, change_pct, prev_close, df = get_stock_data(ticker, cache_buster)
                     
                     if current_price is not None:
                         has_signal, signal_text, alert_sent = check_buy_signal(
@@ -618,28 +684,26 @@ if start_btn:
                         )
                         
                         status_icon = "🚨" if has_signal else "✅"
-                        alert_status = " (알림 전송!)" if alert_sent else ""
+                        alert_status = " (📤 알림 전송!)" if alert_sent else ""
                         st.text(f"{status_icon} {ticker}: ${current_price:.2f} | RSI: {rsi:.1f if rsi else 'N/A'} | {change_pct:.2f}%{alert_status}")
                     else:
                         st.text(f"⚪ {ticker}: 데이터 로드 실패")
                     
-                    # API 부하 방지
                     if idx < len(st.session_state.watchlist) - 1:
                         rate_limited_sleep(1)
             
-            # 서버 부하 방지를 위한 대기 (사용자 설정 값 사용)
             rate_limited_sleep(refresh_interval)
             st.rerun()
 
-# 하단 정보
 st.markdown("---")
 st.markdown("""
 <div class="info-box">
     <b>📌 사용 안내</b><br>
     • <b>RSI (상대강도지수)</b>: 30 이하면 과매도(저평가), 70 이상이면 과매수(고평가)로 판단합니다.<br>
     • <b>알림 조건</b>: RSI ≤ 30 또는 전일 대비 -5% 이상 하락 시 텔레그램으로 알림을 보냅니다.<br>
-    • <b>알림 간격</b>: 동일 종목에 대해 30분에 한 번만 알림이 발송됩니다 (스팸 방지).<br>
-    • <b>시장 시간</b>: 미국 뉴욕 증시 개장 시간 (09:30~16:00 EST) 동안만 감시가 활성화됩니다.
+    • <b>알림 간격</b>: 동일 종목에 대해 설정된 시간(기본 30분)에 한 번만 알림이 발송됩니다.<br>
+    • <b>시장 시간</b>: 미국 뉴욕 증시 개장 시간 (09:30~16:00 EST) 동안만 감시가 활성화됩니다.<br>
+    • <b>쿨다운</b>: 사이드바에서 쿨다운 상태를 확인하고 초기화할 수 있습니다.
 </div>
 """, unsafe_allow_html=True)
 
